@@ -1,122 +1,90 @@
+# KC_amplitude_futures.py
 import requests
 import json
-import pandas as pd
 from datetime import datetime
-import time
 from typing import List, Dict, Optional
 
- # ==================== 参数设置 ====================
-    symbol = 'SUIUSDT'      # 币种设置，如：'BTCUSDT', 'ETHUSDT', 'SOLUSDT'
-    interval = '1h'         # 时间周期：1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
-    kline_count = 1000       # K线数量（最大1000）
-    top_n = 15             # 显示振幅排名前N名
-    # ================================================
-
-
 class SingleCoinAmplitudeAnalyzer:
-    def __init__(self, proxy_config: Optional[Dict] = None):
-        """
-        初始化单币种振幅分析器
-        
-        Args:
-            proxy_config: 代理配置字典，格式如下：
-                {
-                    'http': 'http:127.0.0.1:7777',
-                    'https': 'https:127.0.0.1:7777'
-                }
-        """
-        self.base_url = "https://api.binance.com/api/v3"
+    """
+    支持市场 market='spot' 或 'futures'（USDT 合约 via fapi）
+    amplitude_mode:
+        - 'down_percent' (默认) -> (open - low) / open * 100  （仅对下跌K线有意义）
+        - 'range' -> (high - low) / low * 100  （保留你原始脚本的计算）
+    只统计并返回 close < open 的K线（下跌K线）。
+    """
+    MARKET_ENDPOINTS = {
+        'spot': "https://api.binance.com/api/v3",
+        'futures': "https://fapi.binance.com/fapi/v1",   # USDT 永续/交割合约的 REST
+        # 如果需要 COIN-M（交割合约）可扩展 'coin_m': "https://dapi.binance.com/dapi/v1"
+    }
+
+    def __init__(self, market: str = 'futures', proxy_config: Optional[Dict] = None):
+        if market not in self.MARKET_ENDPOINTS:
+            raise ValueError("market must be one of: " + ", ".join(self.MARKET_ENDPOINTS.keys()))
+        self.base_url = self.MARKET_ENDPOINTS[market]
         self.session = requests.Session()
-        
-        # 设置代理
         if proxy_config:
             self.session.proxies.update(proxy_config)
             print(f"✅ 已配置代理: {proxy_config}")
-        
-        # 设置请求头
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-    
-    def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 100) -> Optional[List]:
-        """
-        获取K线数据
-        
-        Args:
-            symbol: 交易对符号，如 'BTCUSDT'
-            interval: 时间间隔，可选值：1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
-            limit: 获取的K线数量，最大1000
-        
-        Returns:
-            K线数据列表或None
-        """
+        self.market = market
+
+    def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 500) -> Optional[List]:
+        """获取 K 线，limit 最大1000（Binance 限制）"""
         try:
             url = f"{self.base_url}/klines"
             params = {
                 'symbol': symbol.upper(),
                 'interval': interval,
-                'limit': limit
+                'limit': min(max(1, int(limit)), 1000)
             }
-            
-            print(f"🔄 正在获取 {symbol} 的 {limit} 根 {interval} K线数据...")
-            response = self.session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            
-            kline_data = response.json()
-            print(f"✅ 成功获取 {len(kline_data)} 根K线数据")
-            return kline_data
-            
+            print(f"🔄 [{self.market}] 正在获取 {symbol} 的 {params['limit']} 根 {interval} K 线数据...")
+            resp = self.session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"✅ 成功获取 {len(data)} 根K线数据")
+            return data
         except requests.exceptions.RequestException as e:
-            print(f"❌ 获取 {symbol} K线数据失败: {e}")
+            print(f"❌ 获取 {symbol} K线失败: {e}")
             return None
-    
-    def analyze_klines(self, symbol: str, interval: str = '1h', limit: int = 100) -> List[Dict]:
+
+    def analyze_klines(self, symbol: str, interval: str = '1h', limit: int = 500,
+                       amplitude_mode: str = 'down_percent') -> List[Dict]:
         """
-        分析单个币种的K线振幅
-        
-        Args:
-            symbol: 交易对符号
-            interval: 时间间隔
-            limit: K线数量
-        
-        Returns:
-            每根K线的详细分析结果
+        分析 K 线，但只保留下跌 K 线（close < open）。
+        amplitude_mode: 'down_percent' 或 'range'
+        返回按 amplitude 降序的下跌K线列表（完整详情，不限制 top n）。
         """
         kline_data = self.get_kline_data(symbol, interval, limit)
-        
         if not kline_data:
             return []
-        
+
         results = []
-        
-        print(f"\n📊 开始分析 {symbol} 的K线振幅...")
-        print("-" * 80)
-        
-        for i, kline in enumerate(kline_data):
-            # K线数据格式：
-            # [开盘时间, 开盘价, 最高价, 最低价, 收盘价, 成交量, 收盘时间, ...]
-            open_time = int(kline[0])
-            open_price = float(kline[1])
-            high_price = float(kline[2])
-            low_price = float(kline[3])
-            close_price = float(kline[4])
-            volume = float(kline[5])
-            
-            # 计算振幅
-            if low_price > 0:
-                amplitude = ((high_price - low_price) / low_price) * 100
+        for i, k in enumerate(kline_data):
+            open_time = int(k[0])
+            open_price = float(k[1])
+            high_price = float(k[2])
+            low_price = float(k[3])
+            close_price = float(k[4])
+            volume = float(k[5])
+
+            # 只处理下跌 K 线
+            if close_price >= open_price:
+                continue
+
+            # 计算振幅：两种模式
+            if amplitude_mode == 'range':
+                # 保留你原来的度量（high-low）/low
+                amplitude = ((high_price - low_price) / low_price) * 100 if low_price > 0 else 0.0
             else:
-                amplitude = 0.0
-            
-            # 计算涨跌幅
-            if open_price > 0:
-                change_percent = ((close_price - open_price) / open_price) * 100
-            else:
-                change_percent = 0.0
-            
-            # 转换时间戳
+                # down_percent: 以开盘价为基准衡量下探幅度
+                amplitude = ((open_price - low_price) / open_price) * 100 if open_price > 0 else 0.0
+
+            change_percent = ((close_price - open_price) / open_price) * 100 if open_price > 0 else 0.0
             time_str = datetime.fromtimestamp(open_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
-            
+
             results.append({
                 'index': i + 1,
                 'time': time_str,
@@ -128,118 +96,69 @@ class SingleCoinAmplitudeAnalyzer:
                 'amplitude': amplitude,
                 'change_percent': change_percent
             })
-        
-        return results
-    
+
+        # 按振幅降序排序（最大下探优先）
+        results_sorted = sorted(results, key=lambda x: x['amplitude'], reverse=True)
+        return results_sorted
+
     def get_top_amplitudes(self, results: List[Dict], top_n: int = 15) -> List[Dict]:
-        """
-        获取振幅最大的前N根K线
-        
-        Args:
-            results: K线分析结果
-            top_n: 返回前N名
-        
-        Returns:
-            按振幅排序的前N名
-        """
-        sorted_results = sorted(results, key=lambda x: x['amplitude'], reverse=True)
-        return sorted_results[:top_n]
-    
-    def print_results(self, symbol: str, top_results: List[Dict], interval: str):
-        """打印分析结果"""
+        return results[:top_n]
+
+    def print_results(self, symbol: str, top_results: List[Dict], interval: str, market: str):
         if not top_results:
-            print("❌ 没有可显示的结果")
+            print("❌ 没有下跌 K 线被统计（或数据为空）")
             return
-        
-        print(f"\n" + "="*100)
-        print(f"📈 {symbol} - {interval} K线振幅排名 TOP {len(top_results)}")
-        print("="*100)
-        print(f"{'排名':<4} {'时间':<19} {'振幅%':<8} {'涨跌%':<8} {'开盘':<12} {'最高':<12} {'最低':<12} {'收盘':<12}")
+
+        print(f"\n{'='*100}")
+        print(f"📉 {symbol} ({market}) - 仅统计下跌 K 线 的 振幅排名 TOP {len(top_results)}  （时间周期={interval}）")
+        print(f"{'='*100}")
+        print(f"{'排名':<4} {'时间':<19} {'下探振幅%':<10} {'涨跌%':<8} {'开盘':<12} {'最高':<12} {'最低':<12} {'收盘':<12}")
         print("-"*100)
-        
-        for i, result in enumerate(top_results, 1):
-            print(f"{i:<4} {result['time']:<19} "
-                  f"{result['amplitude']:<7.2f}% "
-                  f"{result['change_percent']:<7.2f}% "
-                  f"{result['open']:<12.6f} "
-                  f"{result['high']:<12.6f} "
-                  f"{result['low']:<12.6f} "
-                  f"{result['close']:<12.6f}")
-        
+        for i, r in enumerate(top_results, 1):
+            print(f"{i:<4} {r['time']:<19} {r['amplitude']:<9.2f}% {r['change_percent']:<7.2f}% "
+                  f"{r['open']:<12.6f} {r['high']:<12.6f} {r['low']:<12.6f} {r['close']:<12.6f}")
         print("="*100)
-        
-        # 统计信息
-        amplitudes = [r['amplitude'] for r in top_results]
-        avg_amplitude = sum(amplitudes) / len(amplitudes)
-        max_amplitude = max(amplitudes)
-        min_amplitude = min(amplitudes)
-        
-        print(f"\n📊 统计信息:")
-        print(f"   平均振幅: {avg_amplitude:.2f}%")
-        print(f"   最大振幅: {max_amplitude:.2f}%")
-        print(f"   最小振幅: {min_amplitude:.2f}%")
-    
+
     def save_results(self, symbol: str, results: List[Dict], interval: str) -> str:
-        """保存结果到文件"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{symbol}_{interval}_amplitude_analysis_{timestamp}.json"
-        
-        save_data = {
-            'symbol': symbol,
-            'interval': interval,
-            'analysis_time': timestamp,
-            'total_klines': len(results),
-            'results': results
-        }
-        
+        filename = f"{symbol}_{interval}_futures_down_amplitude_{timestamp}.json"
         with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
-        
+            json.dump({
+                'symbol': symbol,
+                'market': self.market,
+                'interval': interval,
+                'analysis_time': timestamp,
+                'total_down_klines': len(results),
+                'results': results
+            }, f, ensure_ascii=False, indent=2)
         return filename
 
 
 def main():
-    """主函数"""
-    # 代理配置（根据您的实际代理修改）
-    proxy_config = {
-        'http': 'http://127.0.0.1:7890',    # 替换为您的代理地址和端口
-        'https': 'http://127.0.0.1:7890'    # 替换为您的代理地址和端口
-    }
-    
-    # 如果不需要代理，设置为None
-    # proxy_config = None
-    
-    # 初始化分析器
-    analyzer = SingleCoinAmplitudeAnalyzer(proxy_config=proxy_config)
-    
-   
-    
-    print(f"🚀 开始分析 {symbol} 币种")
-    print(f"📋 分析参数: 时间周期={interval}, K线数量={kline_count}, 显示前{top_n}名")
-    
-    # 执行分析
-    results = analyzer.analyze_klines(symbol, interval, kline_count)
-    
+    # proxy_config = None 或者按需配置
+    proxy_config = None
+    analyzer = SingleCoinAmplitudeAnalyzer(market='futures', proxy_config=proxy_config)
+
+    # ========== 参数 ==========
+    symbol = 'BTCUSDT'   # 注意合约对，通常 USDT 永续/交割合约 用 BTCUSDT/ETHUSDT 等
+    interval = '1h'
+    kline_count = 500
+    top_n = 20
+    amplitude_mode = 'down_percent'   # 'down_percent' 或 'range'
+    # ==========================
+
+    results = analyzer.analyze_klines(symbol, interval, kline_count, amplitude_mode=amplitude_mode)
     if not results:
-        print("❌ 分析失败，请检查网络连接、代理设置或币种名称")
+        print("❌ 没有获取到有效的下跌K线，请检查symbol/market/网络。")
         return
-    
-    # 获取振幅排名前N的K线
+
     top_results = analyzer.get_top_amplitudes(results, top_n)
-    
-    # 显示结果
-    analyzer.print_results(symbol, top_results, interval)
-    
-    # 保存完整结果
+    analyzer.print_results(symbol, top_results, interval, analyzer.market)
     filename = analyzer.save_results(symbol, results, interval)
-    print(f"\n💾 完整分析结果已保存到: {filename}")
-    
-    # 额外信息
-    print(f"\n🔍 如需分析其他币种，请修改代码中的以下参数：")
-    print(f"   symbol = '{symbol}'     # 改为其他币种如 'ETHUSDT', 'SOLUSDT'")
-    print(f"   interval = '{interval}'       # 改为其他时间周期如 '4h', '1d'")
-    print(f"   kline_count = {kline_count}      # 改为其他K线数量（1-1000）")
+    print(f"\n💾 结果已保存: {filename}")
 
 
 if __name__ == "__main__":
     main()
+
+ 
